@@ -601,6 +601,84 @@ async def extract_entities_genkg(
             # it's undirected graph
             maybe_edges[tuple(sorted(k))].extend(v)
     
+    # Apply ensure_graph_connectivity after merging all documents
+    # Convert to GenKG format for connectivity analysis
+    logger.info("Ensuring graph connectivity across all documents...")
+    try:
+        # Convert nano-graphrag format back to GenKG format for connectivity analysis
+        nodes_with_source = []
+        edges_for_connectivity = []
+        
+        # Convert nodes
+        for node_name, node_list in maybe_nodes.items():
+            if node_list:  # Take the first occurrence
+                first_node = node_list[0]
+                # Get the original description and source
+                original_description = first_node.get("description", node_name)
+                source_id = first_node.get("source_id", "unknown")
+                nodes_with_source.append((original_description, source_id))
+        
+        # Convert edges  
+        for (src_id, tgt_id), edge_list in maybe_edges.items():
+            if edge_list:  # Take the first occurrence
+                first_edge = edge_list[0]
+                # Find corresponding nodes with source info
+                src_node_with_source = None
+                tgt_node_with_source = None
+                
+                for node_name, node_list in maybe_nodes.items():
+                    if node_list and node_name == src_id:
+                        first_node = node_list[0]
+                        src_node_with_source = (first_node.get("description", src_id), first_node.get("source_id", "unknown"))
+                    elif node_list and node_name == tgt_id:
+                        first_node = node_list[0]
+                        tgt_node_with_source = (first_node.get("description", tgt_id), first_node.get("source_id", "unknown"))
+                
+                if src_node_with_source and tgt_node_with_source:
+                    edge_attrs = {
+                        "weight": first_edge.get("weight", 1.0),
+                        "relation": first_edge.get("description", "related_to")
+                    }
+                    edges_for_connectivity.append((src_node_with_source, tgt_node_with_source, edge_attrs))
+        
+        # Apply connectivity enhancement
+        enhanced_edges = genkg.ensure_graph_connectivity(nodes_with_source, edges_for_connectivity)
+        
+        # Convert new connectivity edges back to nano-graphrag format
+        for (node1_with_source, node2_with_source, attrs) in enhanced_edges:
+            if (node1_with_source, node2_with_source, attrs) not in edges_for_connectivity:
+                # This is a new connectivity edge
+                node1_text, node1_source = node1_with_source
+                node2_text, node2_source = node2_with_source
+                
+                # Apply same normalization as nodes
+                def normalize_node_name(name):
+                    return ' '.join((name.strip()
+                                   .replace('(', ' ')
+                                   .replace(')', ' ')
+                                   .replace('-', ' ')
+                                   .replace('/', ' ')
+                                   .replace('&', 'AND')).split()).upper()
+                
+                clean_node1 = normalize_node_name(node1_text)
+                clean_node2 = normalize_node_name(node2_text)
+                
+                if clean_node1 and clean_node2:
+                    edge_data = {
+                        "src_id": clean_node1,
+                        "tgt_id": clean_node2,
+                        "weight": attrs.get("weight", 0.1),  # Lower weight for connectivity edges
+                        "description": attrs.get("relation", "semantic_similarity"),
+                        "source_id": "connectivity_enhancement",
+                    }
+                    maybe_edges[tuple(sorted((clean_node1, clean_node2)))].append(edge_data)
+                    logger.info(f"Added connectivity edge: {clean_node1} <-> {clean_node2}")
+        
+        logger.info(f"Graph connectivity analysis completed. Total edges after enhancement: {len(maybe_edges)}")
+        
+    except Exception as e:
+        logger.warning(f"Graph connectivity enhancement failed: {e}. Proceeding with original edges.")
+    
     # Use nano-graphrag's existing merge functions
     logger.info(f"About to merge {len(maybe_nodes)} node types and {len(maybe_edges)} edge types")
     all_entities_data = await asyncio.gather(
