@@ -993,22 +993,48 @@ async def _find_most_related_text_unit_from_entities(
         if v is not None
     }
     all_text_units_lookup = {}
+    
+    # FIXED: Get all chunk data to map document IDs to chunk IDs
+    all_chunks_data = await text_chunks_db.get_by_ids(list(text_chunks_db._data.keys()))
+    doc_to_chunks_mapping = {}
+    for chunk_id, chunk_data in zip(text_chunks_db._data.keys(), all_chunks_data):
+        if chunk_data and isinstance(chunk_data, dict):
+            full_doc_id = chunk_data.get("full_doc_id")
+            if full_doc_id:
+                if full_doc_id not in doc_to_chunks_mapping:
+                    doc_to_chunks_mapping[full_doc_id] = []
+                doc_to_chunks_mapping[full_doc_id].append(chunk_id)
+    
     for index, (this_text_units, this_edges) in enumerate(zip(text_units, edges)):
         for c_id in this_text_units:
-            if c_id in all_text_units_lookup:
+            # FIXED: Handle both chunk IDs and document IDs
+            actual_chunk_ids = []
+            if c_id.startswith("doc-") and c_id in doc_to_chunks_mapping:
+                # c_id is a document ID, map to its chunk IDs
+                actual_chunk_ids = doc_to_chunks_mapping[c_id]
+                logger.debug(f"Mapping document ID {c_id} to {len(actual_chunk_ids)} chunks")
+            elif not c_id.startswith("doc-"):
+                # c_id is already a chunk ID
+                actual_chunk_ids = [c_id]
+            else:
+                logger.warning(f"Cannot find chunks for document ID: {c_id}")
                 continue
-            relation_counts = 0
-            for e in this_edges:
-                if (
-                    e[1] in all_one_hop_text_units_lookup
-                    and c_id in all_one_hop_text_units_lookup[e[1]]
-                ):
-                    relation_counts += 1
-            all_text_units_lookup[c_id] = {
-                "data": await text_chunks_db.get_by_id(c_id),
-                "order": index,
-                "relation_counts": relation_counts,
-            }
+            
+            for actual_chunk_id in actual_chunk_ids:
+                if actual_chunk_id in all_text_units_lookup:
+                    continue
+                relation_counts = 0
+                for e in this_edges:
+                    if (
+                        e[1] in all_one_hop_text_units_lookup
+                        and c_id in all_one_hop_text_units_lookup[e[1]]
+                    ):
+                        relation_counts += 1
+                all_text_units_lookup[actual_chunk_id] = {
+                    "data": await text_chunks_db.get_by_id(actual_chunk_id),
+                    "order": index,
+                    "relation_counts": relation_counts,
+                }
     if any([v is None for v in all_text_units_lookup.values()]):
         logger.warning("Text chunks are missing, maybe the storage is damaged")
     all_text_units = []
@@ -1018,16 +1044,41 @@ async def _find_most_related_text_unit_from_entities(
         if not isinstance(v, dict):
             logger.warning(f"Text unit data is not a dictionary: {v}")
             continue
-        # Ensure the data structure is valid
-        if "data" not in v or v["data"] is None:
-            logger.warning(f"Text unit missing 'data' field: {k}")
-            continue
-        if not isinstance(v["data"], dict) or "content" not in v["data"]:
-            logger.warning(f"Text unit data missing 'content' field: {k}")
-            continue
-        all_text_units.append({"id": k, **v})
+        
+        # FIXED: Handle both data structures - with and without 'data' wrapper
+        if "data" in v and v["data"] is not None:
+            # Structure: {"data": {"content": "...", "tokens": ...}, "order": ...}
+            data_dict = v["data"]
+            if not isinstance(data_dict, dict) or "content" not in data_dict:
+                logger.warning(f"Text unit data missing 'content' field: {k}")
+                continue
+            # Preserve the original structure
+            all_text_units.append({"id": k, **v})
+        else:
+            # Structure: {"content": "...", "tokens": ..., "chunk_order_index": ...}
+            if "content" not in v:
+                logger.warning(f"Text unit missing 'content' field: {k}")
+                continue
+            
+            # Convert to expected structure with 'data' wrapper
+            normalized_data = {
+                "content": v.get("content", ""),
+                "tokens": v.get("tokens", 0),
+                "chunk_order_index": v.get("chunk_order_index", 0),
+                "full_doc_id": v.get("full_doc_id", "")
+            }
+            
+            # Create the expected structure
+            normalized_unit = {
+                "id": k,
+                "data": normalized_data,
+                "order": v.get("chunk_order_index", 0),  # Map chunk_order_index to order
+                "relation_counts": v.get("relation_counts", 0)  # Default to 0 if not present
+            }
+            all_text_units.append(normalized_unit)
+    
     all_text_units = sorted(
-        all_text_units, key=lambda x: (x["order"], -x["relation_counts"])
+        all_text_units, key=lambda x: (x.get("order", 0), -x.get("relation_counts", 0))
     )
     all_text_units = truncate_list_by_token_size(
         all_text_units,
