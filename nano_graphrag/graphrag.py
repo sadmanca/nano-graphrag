@@ -417,7 +417,7 @@ class GraphRAG:
                 logger.warning("GenKG not found for visualization")
                 return
                 
-            from genkg import GenerateKG
+            from .genkg import GenerateKG
             logger.info("[GenKG Visualization] Creating output files from stored entities...")
             
             # Use the ALREADY PROCESSED data from nano-graphrag - no duplicate processing!
