@@ -451,7 +451,7 @@ async def extract_entities_genkg(
         possible_genkg_paths = [
             os.path.join(global_config["working_dir"], "..", "nano-graphrag", "genkg.py"),
             os.path.join(global_config["working_dir"], "..", "..", "nano-graphrag", "genkg.py"),
-            os.path.join(os.path.dirname(__file__), "..", "genkg.py"),
+            os.path.join(os.path.dirname(__file__), "genkg.py"),
         ]
         
         genkg_found = False

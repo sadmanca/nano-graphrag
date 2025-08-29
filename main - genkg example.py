@@ -1,5 +1,5 @@
 from scraper import Scraper
-from genkg import GenerateKG
+from nano_graphrag.genkg import GenerateKG
 import time
 import json
 
