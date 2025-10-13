@@ -13,6 +13,8 @@ class QueryParam:
     response_type: str = "Multiple Paragraphs"
     level: int = 2
     top_k: int = 20
+    # Text chunks control
+    include_text_chunks: bool = False  # Set to False to exclude text chunks from context
     # naive search
     naive_max_token_for_text_unit = 12000
     # local search

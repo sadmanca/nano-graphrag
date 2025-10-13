@@ -1256,9 +1256,17 @@ async def _build_local_query_context(
     use_communities = await _find_most_related_community_from_entities(
         node_datas, query_param, community_reports
     )
-    use_text_units = await _find_most_related_text_unit_from_entities(
-        node_datas, query_param, text_chunks_db, knowledge_graph_inst
-    )
+    
+    # Conditionally retrieve text chunks based on query parameter
+    if query_param.include_text_chunks:
+        logger.info("Text chunks: ENABLED - Including text chunks in query context")
+        use_text_units = await _find_most_related_text_unit_from_entities(
+            node_datas, query_param, text_chunks_db, knowledge_graph_inst
+        )
+    else:
+        logger.info("Text chunks: DISABLED - Excluding text chunks from query context")
+        use_text_units = []
+    
     use_relations = await _find_most_related_edges_from_entities(
         node_datas, query_param, knowledge_graph_inst
     )
