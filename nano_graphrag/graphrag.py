@@ -21,6 +21,7 @@ from ._llm import (
 )
 from ._op import (
     chunking_by_token_size,
+    chunking_large_context,  # New optimized chunking for large context models
     extract_entities,
     extract_entities_genkg,
     generate_community_report,
@@ -49,6 +50,71 @@ from .base import (
     StorageNameSpace,
     QueryParam,
 )
+from .prompt import GRAPH_FIELD_SEP
+
+# Enhanced KG imports - using new enhanced_kg module
+try:  # pragma: no cover - best effort import
+    from .enhanced_kg import gemini_create_nodes, create_edges_by_gemini, EnhancedKG
+    _HAS_ENHANCED_KG_FUNCS = True
+except Exception:  # noqa: E722
+    gemini_create_nodes = None  # type: ignore
+    create_edges_by_gemini = None  # type: ignore
+    EnhancedKG = None  # type: ignore
+    _HAS_ENHANCED_KG_FUNCS = False
+
+# Genkg.py fallback for enhanced node/edge generation
+try:  # pragma: no cover - genkg.py fallback
+    if not _HAS_ENHANCED_KG_FUNCS:
+        # Try to import from genkg.py
+        import sys
+        from pathlib import Path
+        genkg_path = Path(__file__).parent.parent
+        if str(genkg_path) not in sys.path:
+            sys.path.insert(0, str(genkg_path))
+        
+        from genkg import GenerateKG
+        # Create a global genkg instance to use for node/edge creation
+        _genkg_instance = GenerateKG(llm_provider="gemini", model_name="gemini-2.5-flash")
+        
+        # Wrap genkg methods to match expected signatures
+        def gemini_create_nodes(content, node_limit, source_id):
+            """Wrapper for genkg.gemini_create_nodes"""
+            try:
+                return _genkg_instance.gemini_create_nodes(content, node_limit, source_id)
+            except Exception as e:
+                print(f"Error in genkg node creation: {e}")
+                return []
+        
+        def create_edges_by_gemini(nodes_with_source, papers_dict, model_name=None):
+            """Wrapper for genkg.create_edges_by_gemini"""
+            try:
+                # Convert nodes_with_source from (node_id, node_data) format to expected format
+                converted_nodes = [(node_data.get("description", node_id), node_data.get("source_id", "")) 
+                                 for node_id, node_data in nodes_with_source]
+                # genkg.py method expects summarized_papers, but we have papers_dict (full content)
+                # For now, just use the papers_dict as-is since it's passed as summarized_papers parameter
+                return _genkg_instance.create_edges_by_gemini(converted_nodes, papers_dict)
+            except Exception as e:
+                print(f"Error in genkg edge creation: {e}")
+                return []
+        
+        _HAS_GEMINI_CREATE_FUNCS = True
+        print("Using genkg.py for enhanced node and edge generation")
+    else:
+        _HAS_GEMINI_CREATE_FUNCS = True
+except Exception as e:  # noqa: E722
+    print(f"Failed to import genkg.py functions: {e}")
+    # Legacy fallback for old gemini functions
+    try:  # pragma: no cover - legacy fallback
+        from gemini_create_nodes import gemini_create_nodes as legacy_gemini_create_nodes
+        from gemini_create_edges import create_edges_by_gemini as legacy_create_edges_by_gemini
+        gemini_create_nodes = legacy_gemini_create_nodes
+        create_edges_by_gemini = legacy_create_edges_by_gemini
+        _HAS_GEMINI_CREATE_FUNCS = True
+        print("Using legacy gemini functions")
+    except Exception:  # noqa: E722
+        _HAS_GEMINI_CREATE_FUNCS = False
+        print("No enhanced node/edge generation functions available")
 
 
 @dataclass
@@ -70,14 +136,15 @@ class GraphRAG:
             Optional[int],
         ],
         List[Dict[str, Union[str, int]]],
-    ] = chunking_by_token_size
-    chunk_token_size: int = 1200
-    chunk_overlap_token_size: int = 100
-    tiktoken_model_name: str = "gpt-4o"
+    ] = chunking_large_context  # Default to optimized chunking for Gemini 2.5 Flash Lite
+    chunk_token_size: int = 32768  # Large chunks for 1M context window
+    chunk_overlap_token_size: int = 2048  # Proportional overlap for large chunks
+    # Tokenizer model reference (legacy config - now uses cl100k_base encoding directly)
+    tiktoken_model_name: str = "cl100k_base"  # Direct encoding for compatibility
 
     # entity extraction
-    entity_extract_max_gleaning: int = 1
-    entity_summary_to_max_tokens: int = 500
+    entity_extract_max_gleaning: int = 0  # Reduced for speed - Gemini 2.5 is more capable
+    entity_summary_to_max_tokens: int = 2000  # Increased for better summaries
 
     # graph clustering
     graph_cluster_algorithm: str = "leiden"
@@ -320,18 +387,124 @@ class GraphRAG:
             # TODO: no incremental update for communities now, so just drop all
             await self.community_reports.drop()
 
-            # ---------- extract/summary entity and upsert to graph
-            logger.info("[Entity Extraction]...")
-            maybe_new_kg = await self.entity_extraction_func(
-                inserting_chunks,
-                knwoledge_graph_inst=self.chunk_entity_relation_graph,
-                entity_vdb=self.entities_vdb,
-                global_config=asdict(self),
-            )
-            if maybe_new_kg is None:
-                logger.warning("No new entities found")
-                return
-            self.chunk_entity_relation_graph = maybe_new_kg
+            # ---------- Knowledge Graph Construction ----------
+            # Option A: Gemini-based concept + edge suggestion
+            if self.use_gemini_extraction:
+                if not _HAS_GEMINI_CREATE_FUNCS:
+                    logger.warning("Gemini extraction requested but helper functions not importable. Skipping.")
+                else:
+                    logger.info("[Gemini Extraction] generating nodes & edges ...")
+                    # Build papers dict (doc_id -> full content)
+                    papers_dict = {doc_id: dp["content"] for doc_id, dp in new_docs.items()}
+                    # Gather nodes per document
+                    all_nodes = []  # list of (concept, source_doc_id)
+                    for doc_id, dp in new_docs.items():
+                        try:
+                            nodes_for_doc = gemini_create_nodes(
+                                dp["content"], self.gemini_node_limit, doc_id
+                            ) if gemini_create_nodes else []
+                        except Exception as e:  # pragma: no cover - external API failures
+                            logger.warning(f"Gemini node creation failed for {doc_id}: {e}")
+                            nodes_for_doc = []
+                        all_nodes.extend(nodes_for_doc)
+                    # Deduplicate & merge sources
+                    merged_nodes: dict[str, dict] = {}
+                    for concept, source in all_nodes:
+                        concept_up = concept.upper().strip()
+                        if not concept_up:
+                            continue
+                        if concept_up not in merged_nodes:
+                            merged_nodes[concept_up] = {
+                                "entity_type": '"GEMINI"',
+                                "description": concept.strip(),
+                                "source_id": source,
+                            }
+                        else:
+                            # merge sources / descriptions
+                            if concept.strip() not in merged_nodes[concept_up]["description"].split(GRAPH_FIELD_SEP):
+                                merged_nodes[concept_up]["description"] += GRAPH_FIELD_SEP + concept.strip()
+                            if source not in merged_nodes[concept_up]["source_id"].split(GRAPH_FIELD_SEP):
+                                merged_nodes[concept_up]["source_id"] += GRAPH_FIELD_SEP + source
+                    # Upsert nodes
+                    for node_id, node_data in merged_nodes.items():
+                        try:
+                            await self.chunk_entity_relation_graph.upsert_node(node_id, node_data)
+                        except Exception as e:  # pragma: no cover
+                            logger.warning(f"Failed to upsert Gemini node {node_id}: {e}")
+                    # Create edges via Gemini using (concept, source) tuples
+                    edges = []
+                    try:
+                        edges = create_edges_by_gemini(
+                            list(merged_nodes.items()),  # but our items are node_id->data; adapt to expected format
+                            papers_dict,
+                        ) if create_edges_by_gemini else []
+                    except Exception as e:  # pragma: no cover
+                        logger.warning(f"Gemini edge creation failed: {e}")
+                        edges = []
+                    # edges expected: [ ((node1, source1),(node2, source2), {attrs}) ]
+                    for edge in edges:
+                        try:
+                            (n1_text, _src1), (n2_text, _src2), attrs = edge
+                            n1 = n1_text.upper().strip()
+                            n2 = n2_text.upper().strip()
+                            if not n1 or not n2 or n1 == n2:
+                                continue
+                            # Ensure nodes exist (might not if Gemini referenced unseen concept)
+                            for nid, raw in [(n1, n1_text), (n2, n2_text)]:
+                                if not await self.chunk_entity_relation_graph.has_node(nid):
+                                    await self.chunk_entity_relation_graph.upsert_node(
+                                        nid,
+                                        node_data={
+                                            "entity_type": '"GEMINI"',
+                                            "description": raw,
+                                            "source_id": "",
+                                        },
+                                    )
+                            weight = float(attrs.get("weight", 1.0)) if isinstance(attrs, dict) else 1.0
+                            relation = attrs.get("relation", "related_to") if isinstance(attrs, dict) else "related_to"
+                            await self.chunk_entity_relation_graph.upsert_edge(
+                                n1,
+                                n2,
+                                edge_data={
+                                    "weight": weight,
+                                    "description": relation,
+                                    "source_id": merged_nodes.get(n1, {}).get("source_id", "") + GRAPH_FIELD_SEP + merged_nodes.get(n2, {}).get("source_id", ""),
+                                    "order": 1,
+                                },
+                            )
+                        except Exception as e:  # pragma: no cover
+                            logger.warning(f"Failed to upsert Gemini edge: {e}")
+                    logger.info(
+                        f"Gemini KG added {len(merged_nodes)} nodes and {len(edges)} edges"
+                    )
+                    # If not combining, skip default extraction
+                    if not self.gemini_combine_with_llm_extraction:
+                        maybe_new_kg = self.chunk_entity_relation_graph
+                    else:
+                        logger.info("[Entity Extraction] (combined) ...")
+                        maybe_new_kg = await self.entity_extraction_func(
+                            inserting_chunks,
+                            knwoledge_graph_inst=self.chunk_entity_relation_graph,
+                            entity_vdb=self.entities_vdb,
+                            global_config=asdict(self),
+                        )
+                        if maybe_new_kg is None:
+                            logger.warning("LLM entity extraction found no additional entities (Gemini results kept)")
+                            maybe_new_kg = self.chunk_entity_relation_graph
+                    self.chunk_entity_relation_graph = maybe_new_kg
+            else:
+                # Default path only
+                logger.info("[Entity Extraction] ...")
+                maybe_new_kg = await self.entity_extraction_func(
+                    inserting_chunks,
+                    knwoledge_graph_inst=self.chunk_entity_relation_graph,
+                    entity_vdb=self.entities_vdb,
+                    global_config=asdict(self),
+                )
+                if maybe_new_kg is None:
+                    logger.warning("No new entities found")
+                    return
+                self.chunk_entity_relation_graph = maybe_new_kg
             # ---------- update clusterings of graph
             logger.info("[Community Report]...")
             await self.chunk_entity_relation_graph.clustering(
