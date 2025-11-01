@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/MSadm/Documents/Sadman/code/ece496/rrc3/nano-graphrag/**)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
